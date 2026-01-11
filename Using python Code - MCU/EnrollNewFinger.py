@@ -1,89 +1,105 @@
 import serial
 import time
 
-SERIAL_PORT = 'COM3'      # Change to your USB-TTL port
-BAUD_RATE = 115200
-DID = 0x01                # Try 0x00 if no response
+# ================= CONFIG =================
+PORT = 'COM3'
+BAUD = 115200
+DID  = 0x00
+# =========================================
 
-ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=2)
-time.sleep(0.3)
+ser = serial.Serial(PORT, BAUD, timeout=2)
+time.sleep(0.5)
 
 def cmd(cmd_id, data=b''):
-    packet = bytearray(26)
-    packet[0:4] = b'\x55\xAA\x00' + DID.to_bytes(1, 'little')
-    packet[4:6] = cmd_id.to_bytes(2, 'little')
-    packet[6:8] = len(data).to_bytes(2, 'little')
-    packet[8:8+len(data)] = data
-    packet[24:26] = (sum(packet[:24]) & 0xFFFF).to_bytes(2, 'little')
-    ser.write(packet)
+    pkt = bytearray(26)
+    pkt[0:4] = b'\x55\xAA\x00' + DID.to_bytes(1, 'little')
+    pkt[4:6] = cmd_id.to_bytes(2, 'little')
+    pkt[6:8] = len(data).to_bytes(2, 'little')
+    pkt[8:8+len(data)] = data
+    pkt[24:26] = (sum(pkt[:24]) & 0xFFFF).to_bytes(2, 'little')
+
+    ser.write(pkt)
     resp = ser.read(26)
-    if len(resp) < 26 or resp[0:2] != b'\xAA\x55':
-        return 0xFF, b''
+
+    if len(resp) != 26 or resp[0:2] != b'\xAA\x55':
+        return 0xFFFF, b''
+
     ret = int.from_bytes(resp[8:10], 'little')
-    data_len = int.from_bytes(resp[6:8], 'little') - 2
-    return ret, resp[10:10+data_len] if data_len > 0 else b''
+    ln  = int.from_bytes(resp[6:8], 'little') - 2
+    return ret, resp[10:10+ln] if ln > 0 else b''
 
-# Prompt for ID
-try:
-    fid = int(input("Enter the fingerprint ID to enroll (1-80): "))
-    if not 1 <= fid <= 80:
-        print("ID must be between 1 and 80")
-        ser.close()
-        exit()
-except:
-    print("Invalid input")
-    ser.close()
+
+def wait_finger_present():
+    while True:
+        if cmd(0x0020)[0] == 0x0000:
+            return
+        time.sleep(0.2)
+
+
+def wait_finger_removed():
+    while True:
+        if cmd(0x0021)[0] == 0x0000:
+            break
+        time.sleep(0.2)
+
+    while cmd(0x0020)[0] == 0x0000:
+        time.sleep(0.2)
+
+    time.sleep(0.6)
+
+
+# ================= ENROLL =================
+fid = int(input("Enter fingerprint ID (1–80): "))
+print(f"\nEnrolling ID {fid}")
+
+# Start enrollment
+cmd(0x0046, fid.to_bytes(2, 'little'))
+
+# -------- First finger --------
+print("Place finger (1/3)...")
+wait_finger_present()
+
+if cmd(0x0060, b'\x00\x00')[0] != 0x0000:
+    print("First template failed")
     exit()
 
-print(f"Enrolling fingerprint for ID: {fid}")
+print("Lift finger")
+wait_finger_removed()
 
-# Force delete if ID exists (to avoid duplication errors)
-del_data = fid.to_bytes(2, 'little') + fid.to_bytes(2, 'little')
-ret, _ = cmd(0x0040, del_data)
-if ret == 0x0000:
-    print("Existing template deleted")
-else:
-    print(f"Delete returned 0x{ret:04X} - continuing")
+# -------- Second finger --------
+print("Place same finger (2/3)...")
+wait_finger_present()
 
-# Single press enrollment (reliable for this module)
-print("Press finger firmly in the center and keep it steady...")
-
-while True:
-    ret, _ = cmd(0x0021)
-    if ret == 0x0000:
-        break
-    time.sleep(0.3)
-
-time.sleep(1.0)  # Stabilize
-
-# Capture image with retries
-for _ in range(10):
-    ret, _ = cmd(0x0020)
-    if ret == 0x0000:
-        break
-    time.sleep(1.0)
-
-if ret != 0x0000:
-    print(f"Image capture failed (error 0x{ret:04X})")
-    ser.close()
+if cmd(0x0060, b'\x01\x00')[0] != 0x0000:
+    print("Second template failed")
     exit()
 
-# Generate template in buffer 0 (valid for ID809)
-ret, _ = cmd(0x0060, b'\x00\x00')
-if ret != 0x0000:
-    print(f"Template generation failed (error 0x{ret:04X}) - try better finger placement")
-    ser.close()
+print("Lift finger")
+wait_finger_removed()
+
+# -------- Third finger --------
+print("Place same finger (3/3)...")
+wait_finger_present()
+
+if cmd(0x0060, b'\x02\x00')[0] != 0x0000:
+    print("Third template failed")
     exit()
 
-print("Lift finger now.")
-time.sleep(4)
+print("Lift finger")
+wait_finger_removed()
 
-# Store from buffer 0 to ID
-store_data = b'\x00\x00' + fid.to_bytes(2, 'little')
-ret, _ = cmd(0x0062, store_data)
-if ret == 0x0000:
-    print(f"Enrollment successful! Fingerprint stored as ID {fid}")
-else:
-    print(f"Store failed (error code: 0x{ret:04X})")
+# -------- Merge (3 templates) --------
+if cmd(0x0061, b'\x00\x00\x03\x00')[0] != 0x0000:
+    print("Template merge failed")
+    exit()
 
+# -------- Store --------
+if cmd(0x0040, fid.to_bytes(2, 'little') + b'\x00\x00')[0] != 0x0000:
+    print("Store failed")
+    exit()
+
+# -------- End --------
+cmd(0x0024, b'\x00\x00')
+
+print("Enrollment successful (3-scan)")
 ser.close()
